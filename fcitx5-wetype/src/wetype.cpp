@@ -65,7 +65,8 @@ enum class PinyinScheme { FullPinyin, Flypy };
 FCITX_CONFIG_ENUM_NAME_WITH_I18N(PinyinScheme, N_("全拼"), N_("小鹤双拼"));
 FCITX_CONFIGURATION(WeTypeConfig,
     OptionWithAnnotation<PinyinScheme, PinyinSchemeI18NAnnotation> pinyinScheme{
-        this, "PinyinScheme", "拼音方案", PinyinScheme::FullPinyin};);
+        this, "PinyinScheme", "拼音方案", PinyinScheme::FullPinyin};
+    Option<bool> shiftToggle{this, "ShiftToggle", "单按 Shift 切换中英文", true};);
 
 // Display-only segmentation. The original unsegmented buffer is still sent to
 // the WeType engine, so this never changes composition or candidate matching.
@@ -493,7 +494,7 @@ public:
                 auto &key=static_cast<KeyEvent &>(event);
                 auto *ic=key.inputContext();
                 const auto *entry=instance_->inputMethodEntry(ic);
-                if (!entry || entry->uniqueName()!="wetype-im" || ic->capabilityFlags().test(CapabilityFlag::Password)) return;
+                if (!*config_.shiftToggle || !entry || entry->uniqueName()!="wetype-im" || ic->capabilityFlags().test(CapabilityFlag::Password)) return;
                 auto *state=ic->propertyFor(&modeFactory_);
                 const auto symbol=key.key().sym();
                 if (symbol==FcitxKey_Shift_L || symbol==FcitxKey_Shift_R) {
