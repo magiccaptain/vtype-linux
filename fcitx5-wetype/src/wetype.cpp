@@ -20,6 +20,7 @@
 #include <fcitx/text.h>
 #include <fcitx/candidatelist.h>
 #include <fcitx-utils/keysym.h>
+#include <fcitx-utils/key.h>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/trackableobject.h>
 #include <fcitx-config/configuration.h>
@@ -48,105 +49,19 @@
 #include <string>
 #include <stdexcept>
 #include <vector>
-#include <sstream>
-#include <unordered_set>
 
 #include "glossary.h"
 #include "common_phrases.h"
 #include "harness_log.h"
 #include "punctuation.h"
+#include "config.h"
+#include "pinyin_preedit.h"
+#include "voice_input.h"
 
 namespace fcitx {
 
 static constexpr int FALLBACK_PAGE_SIZE = 5;   // 取不到全局设置时的每页候选数
 static constexpr uint64_t ENGINE_RESTART_DELAY_USEC = 200000;
-
-enum class PinyinScheme { FullPinyin, Flypy };
-FCITX_CONFIG_ENUM_NAME_WITH_I18N(PinyinScheme, N_("全拼"), N_("小鹤双拼"));
-FCITX_CONFIGURATION(WeTypeConfig,
-    OptionWithAnnotation<PinyinScheme, PinyinSchemeI18NAnnotation> pinyinScheme{
-        this, "PinyinScheme", "拼音方案", PinyinScheme::FullPinyin};
-    Option<bool> shiftToggle{this, "ShiftToggle", "单按 Shift 切换中英文", true};);
-
-// Display-only segmentation. The original unsegmented buffer is still sent to
-// the WeType engine, so this never changes composition or candidate matching.
-static std::string segmentPinyin(const std::string &raw) {
-    static const std::unordered_set<std::string> syllables = [] {
-        static const char *data =
-            "a ai an ang ao e ei en eng er o ou "
-            "ba bai ban bang bao bei ben beng bi bian biao bie bin bing bo bu "
-            "pa pai pan pang pao pei pen peng pi pian piao pie pin ping po pou pu "
-            "ma mai man mang mao me mei men meng mi mian miao mie min ming miu mo mou mu "
-            "fa fan fang fei fen feng fo fou fu "
-            "da dai dan dang dao de dei den deng di dia dian diao die ding diu dong dou du duan dui dun duo "
-            "ta tai tan tang tao te teng ti tian tiao tie ting tong tou tu tuan tui tun tuo "
-            "na nai nan nang nao ne nei nen neng ng ni nian niang niao nie nin ning niu nong nou nu nuan nue nuo nv nve "
-            "la lai lan lang lao le lei leng li lia lian liang liao lie lin ling liu long lou lu luan lue lun luo lv "
-            "ga gai gan gang gao ge gei gen geng gong gou gu gua guai guan guang gui gun guo "
-            "ka kai kan kang kao ke kei ken keng kong kou ku kua kuai kuan kuang kui kun kuo "
-            "ha hai han hang hao he hei hen heng hong hou hu hua huai huan huang hui hun huo "
-            "za zai zan zang zao ze zei zen zeng zha zhai zhan zhang zhao zhe zhei zhen zheng zhi zhong zhou zhu zhua zhuai zhuan zhuang zhui zhun zhuo zi zong zou zu zuan zui zun zuo "
-            "ca cai can cang cao ce cen ceng cha chai chan chang chao che chen cheng chi chong chou chu chua chuai chuan chuang chui chun chuo ci cong cou cu cuan cui cun cuo "
-            "sa sai san sang sao se sen seng sha shai shan shang shao she shei shen sheng shi shou shu shua shuai shuan shuang shui shun shuo si song sou su suan sui sun suo "
-            "ra ran rang rao re ren reng ri rong rou ru ruan rui run ruo "
-            "ji jia jian jiang jiao jie jin jing jiong jiu ju juan jue jun "
-            "qi qia qian qiang qiao qie qin qing qiong qiu qu quan que qun "
-            "xi xia xian xiang xiao xie xin xing xiong xiu xu xuan xue xun "
-            "ya yan yang yao ye yi yin ying yo yong you yu yuan yue yun "
-            "wa wai wan wang wei wen weng wo wu "
-            "bo bei ben beng bian bie bin bing "
-            "ge gei gen geng gong gou gua guai guan guang gui gun guo "
-            "jiong juan jue jun";
-        std::unordered_set<std::string> result;
-        std::istringstream input(data);
-        std::string item;
-        while (input >> item) result.insert(item);
-        return result;
-    }();
-
-    std::string out;
-    for (size_t i = 0; i < raw.size();) {
-        if (raw[i] == '\'') {
-            out += raw[i++];
-            continue;
-        }
-        size_t match = 0;
-        const size_t limit = std::min(raw.size(), i + 6);
-        for (size_t end = limit; end > i; --end) {
-            if (raw.find('\'', i) < end) continue;
-            if (syllables.count(raw.substr(i, end - i))) {
-                match = end - i;
-                break;
-            }
-        }
-        if (match) {
-            if (!out.empty() && out.back() != '\'' && out.back() != ' ') out += ' ';
-            out.append(raw, i, match);
-            i += match;
-        } else {
-            if (!out.empty() && out.back() != '\'' && out.back() != ' ') out += ' ';
-            out.append(raw, i, std::string::npos);
-            break;
-        }
-    }
-    return out;
-}
-
-static Text pinyinPreedit(const std::string &buffer, bool doublePin) {
-    Text text;
-    std::string display;
-    if (doublePin) {
-        // 双拼编码每两键一个音节；不按全拼词表切分，也不改动引擎输入。
-        for (size_t i = 0; i < buffer.size(); i += 2) {
-            if (i) display += ' ';
-            display.append(buffer, i, 2);
-        }
-    } else {
-        display = segmentPinyin(buffer);
-    }
-    if (!display.empty()) text.append(display, TextFormatFlag::NoFlag);
-    return text;
-}
 
 struct GridColumnCandidate : public CandidateWord {
     GridColumnCandidate(Text text, std::function<void(InputContext *)> select)
@@ -227,6 +142,7 @@ public:
     void setOnReady(std::function<void()> cb) { onReady_ = std::move(cb); }
     void setOnExit(std::function<void()> cb) { onExit_ = std::move(cb); }
     void setDoublePinSolution(int value) { doublePinSolution_ = value; }
+    void setFuzzyFlags(uint32_t value) { fuzzyFlags_ = value; }
 
     // 非阻塞启动; 就绪走 IO 事件。指数退避防 fork 风暴(连续 5 次失败放弃)。
     bool start() {
@@ -247,6 +163,7 @@ public:
         // 路径解析与轮转都在父进程做完, 子进程只保留一次 open。
         const std::string harnessLog = prepareHarnessLog();
         const std::string doublePin = std::to_string(doublePinSolution_);
+        const std::string fuzzyVal = std::to_string(fuzzyFlags_);
 
         int inP[2], outP[2];
         if (pipe2(inP, O_CLOEXEC) < 0) return false;
@@ -262,6 +179,7 @@ public:
         }
         if (p == 0) {
             setenv("WETYPE_DOUBLE_PIN", doublePin.c_str(), 1);
+            setenv("WETYPE_FUZZY", fuzzyVal.c_str(), 1);
             if(cloudConfigured_ && setpgid(0,0)<0)_exit(127);
             // QEMU user mode writes guest core files in its current directory.
             // Keep an engine crash from leaving qemu_wetype-harness_*.core in HOME.
@@ -292,7 +210,7 @@ public:
                 // computes in software on every libc++ call: about 2x slower.
                 setenv("QEMU_CPU", "cortex-a72", 0);
                 if(cloudConfigured_) {
-                    execl("/usr/bin/python3","/usr/bin/python3",(eng+"/cloud_proxy.py").c_str(),
+                    execl(WETYPE_PYTHON_EXECUTABLE,WETYPE_PYTHON_EXECUTABLE,(eng+"/cloud_proxy.py").c_str(),
                         "--config",cloudConfig.c_str(),"--",qemu.c_str(),"-L",sysroot.c_str(),
                         (eng+"/wetype-harness").c_str(),(eng+"/lib/libwxhld_jni.so").c_str(),"--daemon",(char *)nullptr);
                     _exit(127);
@@ -462,6 +380,135 @@ private:
     bool gaveUp_ = false;
     bool cloudConfigured_ = false;
     int doublePinSolution_ = 0;
+    uint32_t fuzzyFlags_ = 0;
+};
+
+// ---------------------------------------------------------------- 语音输入辅助进程
+// 常驻的 wetype-cloud.py voice --serve；只有收到 START 才打开麦克风，行协议见 voice_input.h。
+class VoiceHelper {
+public:
+    explicit VoiceHelper(EventLoop &loop) : loop_(loop) {}
+    ~VoiceHelper() { stop(); }
+
+    void setOnLine(std::function<void(const std::string &)> cb) { onLine_ = std::move(cb); }
+    void setOnExit(std::function<void()> cb) { onExit_ = std::move(cb); }
+    bool alive() const { return pid_ > 0; }
+    void resetFailures() { failures_ = 0; }
+
+    bool start() {
+        if (pid_ > 0) return true;
+        if (failures_ >= 5) return false;   // 连续启动即退出，等配置变化后再试
+        std::string eng, dicts, work, qemu, sysroot;
+        resolveDirs(eng, dicts, work, qemu, sysroot);
+        // 测试可用 WETYPE_VOICE_HELPER 指定替身程序。
+        const char *custom = getenv("WETYPE_VOICE_HELPER");
+        const std::string script = eng + "/wetype-cloud.py";
+        if (!(custom && *custom) && access(script.c_str(), R_OK) != 0) return false;
+        int inP[2], outP[2];
+        if (pipe2(inP, O_CLOEXEC) < 0) return false;
+        if (pipe2(outP, O_CLOEXEC) < 0) {
+            close(inP[0]); close(inP[1]);
+            return false;
+        }
+        pid_t p = fork();
+        if (p < 0) {
+            close(inP[0]); close(inP[1]); close(outP[0]); close(outP[1]);
+            return false;
+        }
+        if (p == 0) {
+            // 独立进程组：Fcitx 退出或强制结束时连同录音子进程一起清理。
+            setpgid(0, 0);
+            dup2(inP[0], 0);
+            dup2(outP[1], 1);
+            close(inP[0]); close(inP[1]); close(outP[0]); close(outP[1]);
+            if (custom && *custom) execl(custom, custom, (char *)nullptr);
+            else execl(WETYPE_PYTHON_EXECUTABLE, WETYPE_PYTHON_EXECUTABLE, script.c_str(),
+                       "voice", "--serve", (char *)nullptr);
+            _exit(127);
+        }
+        close(inP[0]);
+        close(outP[1]);
+        pid_ = p; in_ = inP[1]; out_ = outP[0];
+        started_ = now(CLOCK_MONOTONIC);
+        rbuf_.clear();
+        ioSource_ = loop_.addIOEvent(
+            out_, IOEventFlags(IOEventFlag::In),
+            [this](EventSourceIO *, int fd, IOEventFlags) { onReadable(fd); return true; });
+        WLOG("voice helper started pid=%d\n", pid_);
+        return true;
+    }
+
+    void send(const std::string &line) {
+        if (in_ < 0) return;
+        const std::string out = line + "\n";
+        if (write(in_, out.data(), out.size()) < 0) {
+            WLOG("voice helper write failed errno=%d\n", errno);
+            die();
+        }
+    }
+
+    void stop() {
+        if (pid_ > 0) {
+            if (in_ >= 0) {
+                ssize_t w = write(in_, "Q\n", 2);
+                (void)w;
+                close(in_);
+                in_ = -1;
+            }
+            int st = 0;
+            bool exited = false;
+            for (int i = 0; i < 50; ++i) {
+                const pid_t result = waitpid(pid_, &st, WNOHANG);
+                if (result == pid_ || (result < 0 && errno == ECHILD)) { exited = true; break; }
+                usleep(10000);
+            }
+            if (!exited) {
+                kill(-pid_, SIGKILL);
+                while (waitpid(pid_, &st, 0) < 0 && errno == EINTR) {}
+            }
+            pid_ = -1;
+        }
+        if (in_ >= 0) { close(in_); in_ = -1; }
+        if (out_ >= 0) { close(out_); out_ = -1; }
+        ioSource_.reset();
+        rbuf_.clear();
+    }
+
+private:
+    void onReadable(int fd) {
+        char tmp[8192];
+        const ssize_t n = read(fd, tmp, sizeof tmp);
+        if (n <= 0) {
+            WLOG("voice helper EOF\n");
+            die();
+            return;
+        }
+        rbuf_.append(tmp, n);
+        if (rbuf_.size() > 1 << 20) { die(); return; }
+        size_t pos;
+        while (pid_ > 0 && (pos = rbuf_.find('\n')) != std::string::npos) {
+            const std::string line = rbuf_.substr(0, pos);
+            rbuf_.erase(0, pos + 1);
+            if (onLine_) onLine_(line);
+        }
+    }
+
+    void die() {
+        const bool quick = now(CLOCK_MONOTONIC) - started_ < 3000000;
+        stop();
+        failures_ = quick ? failures_ + 1 : 0;
+        if (onExit_) onExit_();
+    }
+
+    EventLoop &loop_;
+    pid_t pid_ = -1;
+    int in_ = -1, out_ = -1;
+    uint64_t started_ = 0;
+    int failures_ = 0;
+    std::string rbuf_;
+    std::unique_ptr<EventSourceIO> ioSource_;
+    std::function<void(const std::string &)> onLine_;
+    std::function<void()> onExit_;
 };
 
 // Punctuation history belongs to one input context and is never shared by
@@ -481,13 +528,19 @@ public:
     explicit WeTypeEngine(Instance *instance)
         : instance_(instance), eng_(instance->eventLoop()) {
         readAsIni(config_, "conf/wetype.conf");
-        eng_.setDoublePinSolution(*config_.pinyinScheme == PinyinScheme::Flypy ? 3 : 0);
+        eng_.setDoublePinSolution(doublePinSolution(*config_.pinyinScheme));
+        eng_.setFuzzyFlags(config_.fuzzyFlags());
         signal(SIGPIPE, SIG_IGN);
         if (!instance_->inputContextManager().registerProperty("wetype-punctuation-state", &punctuationFactory_)) {
             throw std::runtime_error("cannot register WeType punctuation state");
         }
         if (!instance_->inputContextManager().registerProperty("wetype-mode-state", &modeFactory_))
             throw std::runtime_error("cannot register WeType mode state");
+        // 语音输入的按住/松开先于其他处理；中英文模式下都可用。
+        voice_.setOnLine([this](const std::string &line) { onVoiceLine(line); });
+        voice_.setOnExit([this] { onVoiceExit(); });
+        voiceWatcher_=instance_->watchEvent(EventType::InputContextKeyEvent,EventWatcherPhase::PreInputMethod,
+            [this](Event &event) { voiceKey(static_cast<KeyEvent &>(event)); });
         // 在 Fcitx 全局中英开关之前处理单独轻按的 Shift，仅作用于微信输入法；Ctrl+Space 交给 Fcitx。
         modeWatcher_=instance_->watchEvent(EventType::InputContextKeyEvent,EventWatcherPhase::PreInputMethod,
             [this](Event &event) {
@@ -565,8 +618,14 @@ public:
         cloudTimer_=instance_->eventLoop().addTimeEvent(CLOCK_MONOTONIC,now(CLOCK_MONOTONIC)+60000,0,
             [this](EventSourceTime *source,uint64_t){cloudTick();source->setNextInterval(60000);source->setEnabled(true);return true;});
         ensureEngine();
+        // 设了语音按键就预先启动辅助进程，第一次按下时不必等 Python 启动。
+        if (!config_.voiceInputKey->empty()) voice_.start();
     }
     ~WeTypeEngine() override {
+        voiceWatcher_.reset();
+        voiceTimer_.reset();
+        voiceRelease_.reset();
+        voice_.stop();
         syncTimer_.reset();
         cloudTimer_.reset();
         if (syncLock_ >= 0) close(syncLock_);
@@ -578,15 +637,23 @@ public:
     void keyEvent(const InputMethodEntry &, KeyEvent &event) override { processKey(event); }
     const Configuration *getConfig() const override { return &config_; }
     void setConfig(const RawConfig &raw) override {
-        const auto previous = *config_.pinyinScheme;
+        const auto previousScheme = *config_.pinyinScheme;
+        const auto previousFuzzy = config_.fuzzyFlags();
+        const bool previousPreedit = *config_.showPinyinInInput;
         config_.load(raw, true);
         safeSaveAsIni(config_, "conf/wetype.conf");
-        applyPinyinScheme(previous);
+        applyEngineConfig(previousScheme, previousFuzzy);
+        applyPreeditLocation(previousPreedit);
+        applyVoiceConfig();
     }
     void reloadConfig() override {
-        const auto previous = *config_.pinyinScheme;
+        const auto previousScheme = *config_.pinyinScheme;
+        const auto previousFuzzy = config_.fuzzyFlags();
+        const bool previousPreedit = *config_.showPinyinInInput;
         readAsIni(config_, "conf/wetype.conf");
-        applyPinyinScheme(previous);
+        applyEngineConfig(previousScheme, previousFuzzy);
+        applyPreeditLocation(previousPreedit);
+        applyVoiceConfig();
     }
     std::string subMode(const InputMethodEntry &,InputContext &ic) override {
         return ic.propertyFor(&modeFactory_)->english?"英文":"中文";
@@ -610,6 +677,9 @@ public:
     void deactivate(const InputMethodEntry &entry, InputContextEvent &event) override {
         auto *ic = event.inputContext();
         if (!ic) return;
+        // 失焦或切换输入法时放弃本次语音，不把结果上屏到别处。
+        if (voiceState_ != VoiceState::Idle && voiceIc_.get() == ic) cancelVoice();
+        else if (voiceState_ == VoiceState::Idle) voiceHeld_ = false;   // 结果已上屏但键还按着时失焦
         // Fcitx calls deactivate before changing the active input method. If
         // Shift (or another IM toggle) is pressed mid-composition, preserve
         // the unfinished pinyin as literal text instead of dropping it.
@@ -627,8 +697,16 @@ public:
     }
 
 private:
-    void applyPinyinScheme(PinyinScheme previous) {
-        if (previous == *config_.pinyinScheme) return;
+    void applyPreeditLocation(bool previous) {
+        if (previous != *config_.showPinyinInInput) {
+            if (auto *ic = icRef_.get()) updateUI(*ic);
+        }
+    }
+
+    void applyEngineConfig(PinyinScheme previousScheme, uint32_t previousFuzzy) {
+        const bool schemeChanged = (previousScheme != *config_.pinyinScheme);
+        const bool fuzzyChanged = (previousFuzzy != config_.fuzzyFlags());
+        if (!schemeChanged && !fuzzyChanged) return;
         // 保存未完成的输入，再启动带新方案的会话；Q 会刷新学习数据。
         auto *ic = icRef_.get();
         if (ic && (!buf_.empty() || pending_)) {
@@ -640,7 +718,8 @@ private:
         }
         restartSource_.reset();
         eng_.stop();
-        eng_.setDoublePinSolution(*config_.pinyinScheme == PinyinScheme::Flypy ? 3 : 0);
+        eng_.setDoublePinSolution(doublePinSolution(*config_.pinyinScheme));
+        eng_.setFuzzyFlags(config_.fuzzyFlags());
         ensureEngine();
     }
 
@@ -655,8 +734,13 @@ private:
     }
 
     // 每页候选数跟随 fcitx5 全局设置"候选词数量"(1-10), 取不到时回退 5。
+    // 多行模式下每页容量为行数 * 10 (每行 10 个候选)。
     // 翻页步进、面板显示与数字选词都以它为准, 保证每个可见候选都能选中。
     int pageSize() const {
+        if (*config_.multiRowCandidates) {
+            const int rows = std::clamp(*config_.candidateRows, 2, 10);
+            return rows * 10;
+        }
         const int n = instance_->globalConfig().defaultPageSize();
         return (n >= 1 && n <= 10) ? n : FALLBACK_PAGE_SIZE;
     }
@@ -666,15 +750,24 @@ private:
     bool normalizePage() {
         const int oldStart = windowStart_;
         const int oldSelected = selected_;
-        const int count = static_cast<int>(cands_.size());
+        const int oldCount = static_cast<int>(cands_.size());
         const int page = pageSize();
-        if (count == 0) {
-            windowStart_ = selected_ = 0;
+        if (oldCount == 0) {
+            windowStart_ = selected_ = selectedRow_ = 0;
         } else {
-            windowStart_ = std::clamp(windowStart_, 0, count - 1);
+            windowStart_ = std::clamp(windowStart_, 0, oldCount - 1);
             windowStart_ = (windowStart_ / page) * page;
-            selected_ = std::clamp(selected_, windowStart_,
-                                  std::min(windowStart_ + page, count) - 1);
+            if (*config_.multiRowCandidates) {
+                const int rows = std::clamp(*config_.candidateRows, 2, 10);
+                const int cols = 10;
+                const int totalInPage = std::min<int>(rows * cols, oldCount - windowStart_);
+                const int actualRows = std::max(1, (totalInPage + cols - 1) / cols);
+                selectedRow_ = std::clamp(selectedRow_, 0, actualRows - 1);
+                selected_ = std::min<int>(windowStart_ + selectedRow_ * cols, oldCount - 1);
+            } else {
+                selected_ = std::clamp(selected_, windowStart_,
+                                      std::min(windowStart_ + page, oldCount) - 1);
+            }
         }
         return oldStart != windowStart_ || oldSelected != selected_ ||
                (!cands_.empty() && renderedPageSize_ != page);
@@ -684,10 +777,22 @@ private:
         normalizePage();
         renderedPageSize_ = pageSize();
         auto &panel = ic.inputPanel();
+        const bool hadClientPreedit = !panel.clientPreedit().empty();
         panel.reset();
         // Frontends may commit preedit on focus-out; include all consumed text.
-        if (pending_) panel.setPreedit(Text(pendingRaw()));
-        else panel.setPreedit(pinyinPreedit(buf_, *config_.pinyinScheme == PinyinScheme::Flypy));
+        Text preedit = pending_ ? Text(pendingRaw())
+                                : pinyinPreedit(buf_, isDoublePin(*config_.pinyinScheme), cursor_);
+        const bool inInput = *config_.showPinyinInInput &&
+                             ic.capabilityFlags().test(CapabilityFlag::Preedit) &&
+                             ic.isPreeditEnabled();
+        if (inInput) {
+            // 连续输入固定候选框起点；主动行内编辑时显示真实光标。
+            if (!cursorEditing_) preedit.setCursor(0);
+            else if (pending_) preedit.setCursor(static_cast<int>(preedit.textLength()));
+            panel.setClientPreedit(preedit);
+        } else {
+            panel.setPreedit(preedit);
+        }
         if (cands_.empty() && !digitHits_.empty()) {
             // 数字常用语：已输入的数字照常上屏，回车只补全剩余部分。
             panel.setAuxUp(Text("常用语 · 回车补全，Esc 关闭"));
@@ -704,33 +809,78 @@ private:
             panel.setCandidateList(std::move(cl));
         }
         if (!cands_.empty()) {
-            const int start = windowStart_;
-            const int end = std::min<int>(start + pageSize(), cands_.size());
-            const int pageCount = end - start;
-            if (selected_ < start || selected_ >= end) selected_ = start;
-            auto cl = std::make_unique<CommonCandidateList>();
-            cl->setLayoutHint(CandidateLayoutHint::Horizontal);
-            cl->setPageSize(pageCount);
-            for (int index = start; index < end; ++index) {
-                Text candidate;
-                // 序号即选词键: 第 10 个显示为 0, 与 fcitx5 的选词习惯一致
-                const int ordinal = index - start;
-                candidate.append(std::string(1, ordinal == 9 ? '0'
-                                        : static_cast<char>('1' + ordinal)) + " ");
-                candidate.append(cands_[index]);
-                if (const auto *gloss = glossary_.lookup(cands_[index])) {
-                    candidate.append(" " + *gloss, TextFormatFlag::Italic);
+            if (*config_.multiRowCandidates) {
+                const int rows = std::clamp(*config_.candidateRows, 2, 10);
+                const int cols = 10;
+                const int pageCapacity = rows * cols;
+                const int start = windowStart_;
+                const int end = std::min<int>(start + pageCapacity, static_cast<int>(cands_.size()));
+                const int totalInPage = end - start;
+                const int actualRows = std::max(1, (totalInPage + cols - 1) / cols);
+
+                if (selectedRow_ >= actualRows) selectedRow_ = actualRows - 1;
+                if (selectedRow_ < 0) selectedRow_ = 0;
+
+                auto cl = std::make_unique<CommonCandidateList>();
+                cl->setLayoutHint(CandidateLayoutHint::Vertical);
+                cl->setPageSize(actualRows);
+
+                for (int r = 0; r < actualRows; ++r) {
+                    const int rowStart = start + r * cols;
+                    const int rowEnd = std::min<int>(rowStart + cols, end);
+                    Text rowText;
+                    for (int c = 0; c < rowEnd - rowStart; ++c) {
+                        const int candIdx = rowStart + c;
+                        const int ordinal = c;
+                        const char numChar = (ordinal == 9) ? '0' : static_cast<char>('1' + ordinal);
+                        if (c > 0) {
+                            rowText.append("  ");
+                        }
+                        rowText.append(std::string(1, numChar) + ".");
+                        rowText.append(cands_[candIdx]);
+                        if (const auto *gloss = glossary_.lookup(cands_[candIdx])) {
+                            rowText.append(" " + *gloss, TextFormatFlag::Italic);
+                        }
+                    }
+                    cl->append<GridColumnCandidate>(std::move(rowText),
+                        [this, rowStart, generation=candidateGeneration_, revision=revision_](InputContext *context) {
+                            if (generation == candidateGeneration_ && revision == revision_) {
+                                commitCandidate(context, rowStart);
+                            }
+                        });
                 }
-                cl->append<GridColumnCandidate>(std::move(candidate),
-                    [this, index, generation=candidateGeneration_, revision=revision_](InputContext *context) {
-                        if(generation==candidateGeneration_ && revision==revision_)commitCandidate(context, index);
-                    });
+                cl->setGlobalCursorIndex(selectedRow_);
+                panel.setCandidateList(std::move(cl));
+            } else {
+                const int start = windowStart_;
+                const int end = std::min<int>(start + pageSize(), cands_.size());
+                const int pageCount = end - start;
+                if (selected_ < start || selected_ >= end) selected_ = start;
+                auto cl = std::make_unique<CommonCandidateList>();
+                cl->setLayoutHint(CandidateLayoutHint::Horizontal);
+                cl->setPageSize(pageCount);
+                for (int index = start; index < end; ++index) {
+                    Text candidate;
+                    // 序号即选词键: 第 10 个显示为 0, 与 fcitx5 的选词习惯一致
+                    const int ordinal = index - start;
+                    candidate.append(std::string(1, ordinal == 9 ? '0'
+                                            : static_cast<char>('1' + ordinal)) + " ");
+                    candidate.append(cands_[index]);
+                    if (const auto *gloss = glossary_.lookup(cands_[index])) {
+                        candidate.append(" " + *gloss, TextFormatFlag::Italic);
+                    }
+                    cl->append<GridColumnCandidate>(std::move(candidate),
+                        [this, index, generation=candidateGeneration_, revision=revision_](InputContext *context) {
+                            if(generation==candidateGeneration_ && revision==revision_)commitCandidate(context, index);
+                        });
+                }
+                // The API validates this index immediately against the list
+                // size, so set it only after all candidates exist.
+                cl->setGlobalCursorIndex(selected_ - start);
+                panel.setCandidateList(std::move(cl));
             }
-            // The API validates this index immediately against the list
-            // size, so set it only after all candidates exist.
-            cl->setGlobalCursorIndex(selected_ - start);
-            panel.setCandidateList(std::move(cl));
         }
+        if (inInput || hadClientPreedit) ic.updatePreedit();
         ic.updateUserInterface(UserInterfaceComponent::InputPanel);
     }
 
@@ -739,7 +889,15 @@ private:
         ic->propertyFor(&punctuationFactory_)->lastDigit = !text.empty() && text.back()>='0' && text.back()<='9';
     }
 
-    std::string chinesePunctuation(InputContext *ic, KeySym symbol) {
+    std::string punctuationText(InputContext *ic, KeySym symbol) {
+        // 只改变标点，不切换输入语言；组词时仍按原路径上屏当前候选。
+        if (*config_.alwaysEnglishPunctuation &&
+            ((symbol >= FcitxKey_exclam && symbol <= FcitxKey_slash) ||
+             (symbol >= FcitxKey_colon && symbol <= FcitxKey_at) ||
+             (symbol >= FcitxKey_bracketleft && symbol <= FcitxKey_grave) ||
+             (symbol >= FcitxKey_braceleft && symbol <= FcitxKey_asciitilde))) {
+            return std::string(1, static_cast<char>(symbol));
+        }
         if (punctuationLanguage(ic)!=wetype::TextLanguage::Cjk) return {};
         auto *state=ic->propertyFor(&punctuationFactory_);
         switch (symbol) {
@@ -788,11 +946,14 @@ private:
         ic->commitString(text);
         ++revision_;
         buf_.clear();
+        cursor_ = 0;
+        cursorEditing_ = false;
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
         windowStart_ = 0;
         selected_ = 0;
+        selectedRow_ = 0;
         recoveryTried_ = false;
         eng_.send("C", nullptr);          // 重建会话
         updateUI(*ic);
@@ -818,11 +979,14 @@ private:
         ic->commitString(cands_[index]);
         ++revision_;
         buf_.erase(0, cover);
+        cursor_ = std::max(0, cursor_ - cover);
+        cursor_ = std::min(cursor_, static_cast<int>(buf_.size()));
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
         windowStart_ = 0;
         selected_ = 0;
+        selectedRow_ = 0;
         eng_.send(selectionCommand(index), candidateHandler());
         updateUI(*ic);
     }
@@ -976,12 +1140,17 @@ private:
                  preview ? 1 : 0);
             windowStart_ = 0;
             selected_ = 0;
+            selectedRow_ = 0;
             updateUI(*ic);
             if (current && pending_) {
                 if (cands_.empty()) fallbackPending(ic);
                 else {
+                    const int target = (pendingCandidateIndex_ >= 0 &&
+                                        pendingCandidateIndex_ < static_cast<int>(cands_.size()))
+                                       ? pendingCandidateIndex_
+                                       : selected_;
                     disarmPending();
-                    commitCandidate(ic, selected_);
+                    commitCandidate(ic, target);
                     drainQueued(ic);
                 }
             }
@@ -1007,6 +1176,8 @@ private:
         int time;
     };
     bool pending_ = false;
+    int pendingCandidateIndex_ = -1;
+    char pendingTriggerChar_ = ' ';
     std::deque<QueuedKey> queued_;
     std::unique_ptr<EventSourceTime> pendingTimer_;
     bool draining_ = false;
@@ -1022,7 +1193,7 @@ private:
 
     std::string pendingRaw() const {
         std::string raw = buf_;
-        if (pending_) raw += ' ';
+        if (pending_) raw += pendingTriggerChar_;
         for (const auto &key : queued_) {
             if (!key.release) raw += printableText(key.key);
         }
@@ -1031,6 +1202,8 @@ private:
 
     void disarmPending() {
         pending_ = false;
+        pendingCandidateIndex_ = -1;
+        pendingTriggerChar_ = ' ';
         pendingTimer_.reset();
     }
 
@@ -1049,8 +1222,10 @@ private:
         }
     }
 
-    void armPending(InputContext *ic) {
+    void armPending(InputContext *ic, int candidateIndex = -1, char triggerChar = ' ') {
         pending_ = true;
+        pendingCandidateIndex_ = candidateIndex;
+        pendingTriggerChar_ = triggerChar;
         auto ref = ic->watch();
         const auto epoch = epoch_;
         // Finite wait covers SKIP, hung engines, and exhausted restarts.
@@ -1175,6 +1350,8 @@ private:
     }
     EngineProc eng_;
     std::string buf_;
+    int cursor_ = 0;
+    bool cursorEditing_ = false;
     WeTypeConfig config_;
     std::unique_ptr<EventSourceTime> restartSource_;
     std::vector<std::string> cands_;
@@ -1205,10 +1382,254 @@ private:
     bool candidatesCurrent_ = false;
     int windowStart_ = 0;
     int selected_ = 0;
+    int selectedRow_ = 0;
     int renderedPageSize_ = 0;
     bool recoveryTried_ = false;
     uint64_t revision_ = 0;
     TrackableObjectReference<InputContext> icRef_;
+
+    // ------------------------------------------------------------ 语音输入：按住说话、松开结束
+    // 按下即开始录音并流式识别，识别中的文字显示为预编辑；松开后等最终结果上屏。
+    enum class VoiceState { Idle, Listening, Recognizing, Message };
+    static constexpr uint64_t VOICE_TAP_USEC = 300000;      // 按住不到 0.3 秒视为误触，不识别
+    static constexpr uint64_t VOICE_RELEASE_USEC = 40000;   // X11 自动重复会插入成对的松开/按下
+    static constexpr uint64_t VOICE_MESSAGE_USEC = 2500000;
+    VoiceHelper voice_{instance_->eventLoop()};
+    std::unique_ptr<HandlerTableEntry<EventHandler>> voiceWatcher_;
+    std::unique_ptr<EventSourceTime> voiceTimer_, voiceRelease_;
+    VoiceState voiceState_ = VoiceState::Idle;
+    TrackableObjectReference<InputContext> voiceIc_;
+    std::string voiceId_, voiceText_, voiceMessage_;
+    std::deque<int> voiceLevels_;
+    uint64_t voiceSerial_ = 0, voicePressed_ = 0;
+    KeySym voiceSym_ = FcitxKey_None;
+    bool voiceHeld_ = false, voiceRecording_ = false;
+
+    static bool shortcutModifier(const Key &key) {
+        return key.states().testAny(KeyStates{KeyState::Ctrl, KeyState::Alt, KeyState::Super, KeyState::Super2,
+                                              KeyState::Meta, KeyState::Hyper, KeyState::Hyper2, KeyState::Mod5});
+    }
+
+    void applyVoiceConfig() {
+        if (config_.voiceInputKey->empty()) {
+            cancelVoice();
+            voice_.stop();
+            return;
+        }
+        voice_.resetFailures();
+        voice_.start();
+    }
+
+    void voiceKey(KeyEvent &event) {
+        if (voiceState_ == VoiceState::Idle && !voiceHeld_ && (event.isRelease() || config_.voiceInputKey->empty())) return;
+        auto *ic = event.inputContext();
+        const auto *entry = instance_->inputMethodEntry(ic);
+        if (!entry || entry->uniqueName() != "wetype-im") return;
+        const KeySym sym = event.key().sym();
+        if (voiceHeld_ && sym == voiceSym_) {
+            event.filterAndAccept();
+            if (event.isRelease()) {
+                // 稍等再结束：紧接着又按下同一键就是自动重复，继续录音。
+                voiceRelease_ = instance_->eventLoop().addTimeEvent(
+                    CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + VOICE_RELEASE_USEC, 0,
+                    [this](EventSourceTime *, uint64_t) {
+                        auto keepAlive = std::move(voiceRelease_);
+                        releaseVoice();
+                        return true;
+                    });
+            } else {
+                voiceRelease_.reset();
+            }
+            return;
+        }
+        if (event.isRelease()) return;
+        if (voiceState_ == VoiceState::Message && !voiceHeld_) endVoice();
+        if (voiceState_ == VoiceState::Idle) {
+            if (!event.key().checkKeyList(*config_.voiceInputKey)) return;
+            // 正在拼写时按键照常交给拼音；密码框不录音。
+            if (ic->capabilityFlags().test(CapabilityFlag::Password) || !buf_.empty() || pending_) return;
+            startVoice(ic, sym);
+            event.filterAndAccept();
+            return;
+        }
+        if (Key(sym).isModifier()) return;   // 单独按下的修饰键不打断语音
+        if (voiceHeld_ || voiceIc_.get() != ic) {
+            // 按住时又按了别的键（多半是组合键），或换了输入框：放弃这次语音，按键照常处理。
+            cancelVoice();
+            return;
+        }
+        if (voiceState_ == VoiceState::Message) return;
+        // 松开后等待结果期间：Esc 取消；其他按键先把已识别的文字上屏，再照常处理。
+        if (sym == FcitxKey_Escape && !shortcutModifier(event.key())) {
+            cancelVoice();
+            event.filterAndAccept();
+            return;
+        }
+        const std::string text = voiceText_;
+        cancelVoice();
+        if (!text.empty()) {
+            rememberLanguage(ic, text);
+            ic->commitString(text);
+        }
+    }
+
+    void startVoice(InputContext *ic, KeySym sym) {
+        endVoice();
+        voiceIc_ = ic->watch();
+        voiceSym_ = sym;
+        voiceHeld_ = true;
+        voicePressed_ = now(CLOCK_MONOTONIC);
+        if (!voice_.start()) {
+            showVoiceMessage("语音服务无法启动，请检查安装");
+            return;
+        }
+        voiceId_ = std::to_string(++voiceSerial_);
+        voiceRecording_ = true;
+        voiceState_ = VoiceState::Listening;
+        WLOG("voice start id=%s\n", voiceId_.c_str());
+        voice_.send("START " + voiceId_);
+        if (voiceState_ == VoiceState::Listening) renderVoice();
+    }
+
+    void releaseVoice() {
+        if (!voiceHeld_) return;
+        voiceHeld_ = false;
+        if (voiceState_ == VoiceState::Message) return;
+        if (now(CLOCK_MONOTONIC) - voicePressed_ < VOICE_TAP_USEC) {
+            cancelVoice();
+            return;
+        }
+        if (voiceRecording_) {
+            voiceRecording_ = false;
+            voice_.send("STOP " + voiceId_);
+        }
+        if (voiceState_ == VoiceState::Listening) {
+            voiceState_ = VoiceState::Recognizing;
+            renderVoice();
+        }
+    }
+
+    void onVoiceLine(const std::string &line) {
+        const auto message = wetype::parseVoiceLine(line);
+        if (!message || message->id != voiceId_ ||
+            (voiceState_ != VoiceState::Listening && voiceState_ != VoiceState::Recognizing)) return;
+        const auto &kind = message->kind;
+        if (kind == "LEVEL") {
+            voiceLevels_.push_back(std::atoi(message->payload.c_str()));
+            while (voiceLevels_.size() > 8) voiceLevels_.pop_front();
+        } else if (kind == "PARTIAL") {
+            if (auto text = wetype::hexDecode(message->payload)) voiceText_ = std::move(*text);
+        } else if (kind == "RECOGNIZING") {
+            // 松开后、或录满时长上限时，辅助进程结束录音。
+            voiceRecording_ = false;
+            voiceState_ = VoiceState::Recognizing;
+        } else if (kind == "FINAL") {
+            const auto text = wetype::hexDecode(message->payload);
+            finishVoice(text ? *text : voiceText_);
+            return;
+        } else if (kind == "ERROR") {
+            WLOG("voice error id=%s code=%s\n", voiceId_.c_str(), message->payload.c_str());
+            voiceRecording_ = false;
+            showVoiceMessage(wetype::voiceErrorText(message->payload));
+            return;
+        } else if (kind != "LISTENING") {
+            return;
+        }
+        renderVoice();
+    }
+
+    void onVoiceExit() {
+        if (voiceState_ == VoiceState::Listening || voiceState_ == VoiceState::Recognizing) {
+            voiceRecording_ = false;
+            showVoiceMessage("语音服务意外退出，请重试");
+        }
+    }
+
+    void finishVoice(const std::string &text) {
+        WLOG("voice final id=%s len=%zu\n", voiceId_.c_str(), text.size());
+        if (text.empty()) {
+            showVoiceMessage("没有听清，请再说一次");
+            return;
+        }
+        auto *ic = voiceIc_.get();
+        const bool held = voiceHeld_;
+        endVoice();
+        voiceHeld_ = held;   // 录满时长上限时键可能仍按着，之后的松开仍由语音吞掉
+        if (ic) {
+            rememberLanguage(ic, text);
+            ic->commitString(text);
+        }
+    }
+
+    void cancelVoice() {
+        if (voiceRecording_ || voiceState_ == VoiceState::Listening || voiceState_ == VoiceState::Recognizing)
+            voice_.send("CANCEL " + voiceId_);
+        endVoice();
+    }
+
+    // 回到空闲并清掉语音界面。
+    void endVoice() {
+        voiceTimer_.reset();
+        voiceRelease_.reset();
+        const bool shown = voiceState_ != VoiceState::Idle;
+        voiceState_ = VoiceState::Idle;
+        voiceHeld_ = voiceRecording_ = false;
+        voiceText_.clear();
+        voiceMessage_.clear();
+        voiceLevels_.clear();
+        auto *ic = voiceIc_.get();
+        voiceIc_ = TrackableObjectReference<InputContext>();
+        if (shown && ic) {
+            ic->inputPanel().reset();
+            ic->updatePreedit();
+            ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+        }
+    }
+
+    void showVoiceMessage(const std::string &message) {
+        if (voiceRecording_) voice_.send("CANCEL " + voiceId_);
+        voiceRecording_ = false;
+        voiceState_ = VoiceState::Message;
+        voiceMessage_ = message;
+        voiceText_.clear();
+        renderVoice();
+        voiceTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + VOICE_MESSAGE_USEC, 0,
+            [this](EventSourceTime *, uint64_t) {
+                auto keepAlive = std::move(voiceTimer_);
+                if (voiceState_ == VoiceState::Message) {
+                    const bool held = voiceHeld_;
+                    endVoice();
+                    voiceHeld_ = held;
+                }
+                return true;
+            });
+    }
+
+    void renderVoice() {
+        auto *ic = voiceIc_.get();
+        if (!ic) return;
+        std::string aux = "🎤 ";
+        if (voiceState_ == VoiceState::Listening)
+            aux += std::string(voiceText_.empty() ? "请说话 " : "正在听 ") + wetype::voiceMeter(voiceLevels_) + "  松开结束";
+        else if (voiceState_ == VoiceState::Recognizing) aux += "识别中…  Esc 取消";
+        else if (voiceState_ == VoiceState::Message) aux += voiceMessage_;
+        else return;
+        auto &panel = ic->inputPanel();
+        const bool hadClientPreedit = !panel.clientPreedit().empty();
+        panel.reset();
+        panel.setAuxUp(Text(aux));
+        const bool inInput = ic->capabilityFlags().test(CapabilityFlag::Preedit) && ic->isPreeditEnabled();
+        if (!voiceText_.empty() && voiceState_ != VoiceState::Message) {
+            // 识别中的文字直接显示在输入框里（不支持预编辑的程序显示在候选窗）。
+            Text preedit(voiceText_, TextFormatFlag::Underline);
+            preedit.setCursor(static_cast<int>(preedit.textLength()));
+            if (inInput) panel.setClientPreedit(preedit);
+            else panel.setPreedit(preedit);
+        }
+        if (inInput || hadClientPreedit) ic->updatePreedit();
+        ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+    }
 
     // 数字常用语：空闲时连续输入的数字（已上屏）及命中的 (需删除的已输入位数, 常用语全文)。
     std::string digitRun_;
@@ -1277,11 +1698,14 @@ private:
         ++epoch_;
         ++revision_;
         buf_.clear();
+        cursor_ = 0;
+        cursorEditing_ = false;
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
         windowStart_ = 0;
         selected_ = 0;
+        selectedRow_ = 0;
         recoveryTried_ = false;
         eng_.send("C", nullptr);
         if (ic) updateUI(*ic);
@@ -1336,6 +1760,7 @@ void WeTypeEngine::processKey(KeyEvent &event) {
             // The pending Space remains an intent after editing the frozen
             // pinyin. Old replies are invalidated by the new revision.
             buf_.pop_back();
+            cursor_ = std::min(cursor_, static_cast<int>(buf_.size()));
             ++revision_;
             candidatesCurrent_ = false;
             cands_.clear();
@@ -1358,6 +1783,236 @@ void WeTypeEngine::processKey(KeyEvent &event) {
             event.filterAndAccept();
             if (queued_.size() >= 256) fallbackPending(ic);
             else updateUI(*ic);
+            return;
+        }
+    }
+
+    auto matchKeyListCaseInsensitive = [](const Key &eventKey, const std::vector<Key> &list) {
+        if (eventKey.checkKeyList(list) || eventKey.normalize().checkKeyList(list)) return true;
+        const KeySym sym = eventKey.sym();
+        if (sym >= FcitxKey_a && sym <= FcitxKey_z) {
+            const Key toggled(static_cast<KeySym>(sym - FcitxKey_a + FcitxKey_A), eventKey.states());
+            if (toggled.checkKeyList(list) || toggled.normalize().checkKeyList(list)) return true;
+        } else if (sym >= FcitxKey_A && sym <= FcitxKey_Z) {
+            const Key toggled(static_cast<KeySym>(sym - FcitxKey_A + FcitxKey_a), eventKey.states());
+            if (toggled.checkKeyList(list) || toggled.normalize().checkKeyList(list)) return true;
+        }
+        return false;
+    };
+
+    // 多行候选行切换快捷键 (默认 Up/Down, Ctrl+P/N, Ctrl+Up/Down, 可配置及开关)。
+    // 默认键避开 Readline 的 Ctrl+A/E/B/F/D/H/K/U; 用户自定义的键优先于 Readline。
+    if (!event.isRelease() && !buf_.empty() && candidatesCurrent_ && !cands_.empty() &&
+        *config_.multiRowCandidates && *config_.multiRowShortcuts) {
+        const int rows = std::clamp(*config_.candidateRows, 2, 10);
+        const int cols = 10;
+        const int pageCapacity = rows * cols;
+        const int start = windowStart_;
+        const int end = std::min<int>(start + pageCapacity, static_cast<int>(cands_.size()));
+        const int totalInPage = end - start;
+        const int actualRows = std::max(1, (totalInPage + cols - 1) / cols);
+
+        const bool isPrevRow = matchKeyListCaseInsensitive(event.key(), *config_.prevRow);
+        const bool isNextRow = matchKeyListCaseInsensitive(event.key(), *config_.nextRow);
+
+        if (isPrevRow || isNextRow) {
+            const int totalCands = static_cast<int>(cands_.size());
+            if (isNextRow) {
+                if (selectedRow_ + 1 < actualRows) {
+                    ++selectedRow_;
+                } else if (windowStart_ + pageCapacity < totalCands) {
+                    windowStart_ += pageCapacity;
+                    selectedRow_ = 0;
+                } else if (windowStart_ > 0 || actualRows > 1) {
+                    windowStart_ = 0;
+                    selectedRow_ = 0;
+                }
+            } else if (isPrevRow) {
+                if (selectedRow_ > 0) {
+                    --selectedRow_;
+                } else if (windowStart_ > 0) {
+                    windowStart_ = std::max(0, windowStart_ - pageCapacity);
+                    const int prevTotal = std::min<int>(pageCapacity, totalCands - windowStart_);
+                    const int prevRows = std::max(1, (prevTotal + cols - 1) / cols);
+                    selectedRow_ = prevRows - 1;
+                } else if (totalCands > pageCapacity || actualRows > 1) {
+                    const int lastPageStart = ((totalCands - 1) / pageCapacity) * pageCapacity;
+                    windowStart_ = lastPageStart;
+                    const int lastTotal = totalCands - windowStart_;
+                    const int lastRows = std::max(1, (lastTotal + cols - 1) / cols);
+                    selectedRow_ = lastRows - 1;
+                }
+            }
+            selected_ = std::min<int>(windowStart_ + selectedRow_ * cols, totalCands - 1);
+            updateUI(*ic);
+            event.filterAndAccept();
+            return;
+        }
+    }
+
+    // Readline 快捷键 (Ctrl+A/E/B/F/D/H/K/U): 仅在正在输入拼音时生效
+    if (!event.isRelease() && !buf_.empty() && *config_.readlineKeyBindings &&
+        event.key().states().test(KeyState::Ctrl) &&
+        !event.key().states().testAny(KeyStates{KeyState::Alt, KeyState::Super,
+                                                KeyState::Super2, KeyState::Meta,
+                                                KeyState::Hyper, KeyState::Hyper2,
+                                                KeyState::Mod5})) {
+        if (event.key().check(FcitxKey_a, KeyState::Ctrl) || event.key().check(FcitxKey_A, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            cursor_ = 0;
+            updateUI(*ic);
+            event.filterAndAccept();
+            return;
+        } else if (event.key().check(FcitxKey_e, KeyState::Ctrl) || event.key().check(FcitxKey_E, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            cursor_ = static_cast<int>(buf_.size());
+            updateUI(*ic);
+            event.filterAndAccept();
+            return;
+        } else if (event.key().check(FcitxKey_b, KeyState::Ctrl) || event.key().check(FcitxKey_B, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            if (cursor_ > 0) {
+                --cursor_;
+                updateUI(*ic);
+            }
+            event.filterAndAccept();
+            return;
+        } else if (event.key().check(FcitxKey_f, KeyState::Ctrl) || event.key().check(FcitxKey_F, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            if (cursor_ < static_cast<int>(buf_.size())) {
+                ++cursor_;
+                updateUI(*ic);
+            }
+            event.filterAndAccept();
+            return;
+        } else if (event.key().check(FcitxKey_d, KeyState::Ctrl) || event.key().check(FcitxKey_D, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            // Forward delete
+            if (cursor_ < static_cast<int>(buf_.size())) {
+                buf_.erase(cursor_, 1);
+                ++revision_;
+                candidatesCurrent_ = false;
+                eng_.send("C", nullptr);
+                if (buf_.empty()) {
+                    cursor_ = 0;
+                    cands_.clear();
+                    covers_.clear();
+                    candidatesCurrent_ = false;
+                    windowStart_ = 0;
+                    selected_ = 0;
+                    updateUI(*ic);
+                } else {
+                    requestCandidates(buf_);
+                    updateUI(*ic);
+                }
+            }
+            event.filterAndAccept();
+            return;
+        } else if (event.key().check(FcitxKey_h, KeyState::Ctrl) || event.key().check(FcitxKey_H, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            // Backward delete (Backspace)
+            if (cursor_ > 0) {
+                buf_.erase(cursor_ - 1, 1);
+                --cursor_;
+                ++revision_;
+                candidatesCurrent_ = false;
+                eng_.send("C", nullptr);
+                if (buf_.empty()) {
+                    cursor_ = 0;
+                    cands_.clear();
+                    covers_.clear();
+                    candidatesCurrent_ = false;
+                    windowStart_ = 0;
+                    selected_ = 0;
+                    updateUI(*ic);
+                } else {
+                    requestCandidates(buf_);
+                    updateUI(*ic);
+                }
+            }
+            event.filterAndAccept();
+            return;
+        } else if (event.key().check(FcitxKey_k, KeyState::Ctrl) || event.key().check(FcitxKey_K, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            // Delete from cursor to end
+            if (cursor_ < static_cast<int>(buf_.size())) {
+                buf_.erase(cursor_);
+                ++revision_;
+                candidatesCurrent_ = false;
+                eng_.send("C", nullptr);
+                if (buf_.empty()) {
+                    cursor_ = 0;
+                    cands_.clear();
+                    covers_.clear();
+                    candidatesCurrent_ = false;
+                    windowStart_ = 0;
+                    selected_ = 0;
+                    updateUI(*ic);
+                } else {
+                    requestCandidates(buf_);
+                    updateUI(*ic);
+                }
+            }
+            event.filterAndAccept();
+            return;
+        } else if (event.key().check(FcitxKey_u, KeyState::Ctrl) || event.key().check(FcitxKey_U, KeyState::Ctrl)) {
+            cursorEditing_ = true;
+            // Delete from start to cursor
+            if (cursor_ > 0) {
+                buf_.erase(0, cursor_);
+                cursor_ = 0;
+                ++revision_;
+                candidatesCurrent_ = false;
+                eng_.send("C", nullptr);
+                if (buf_.empty()) {
+                    cands_.clear();
+                    covers_.clear();
+                    candidatesCurrent_ = false;
+                    windowStart_ = 0;
+                    selected_ = 0;
+                    updateUI(*ic);
+                } else {
+                    requestCandidates(buf_);
+                    updateUI(*ic);
+                }
+            }
+            event.filterAndAccept();
+            return;
+        } else if (sym == FcitxKey_Left) {
+            cursorEditing_ = true;
+            const bool doublePin = isDoublePin(*config_.pinyinScheme);
+            cursor_ = previousPinyinWord(buf_, cursor_, doublePin);
+            updateUI(*ic);
+            event.filterAndAccept();
+            return;
+        } else if (sym == FcitxKey_Right) {
+            cursorEditing_ = true;
+            const bool doublePin = isDoublePin(*config_.pinyinScheme);
+            cursor_ = nextPinyinWord(buf_, cursor_, doublePin);
+            updateUI(*ic);
+            event.filterAndAccept();
+            return;
+        }
+    }
+
+    // Readline 快捷键 (Alt+B/F, Alt+Left/Right): 单词/音节级光标移动
+    if (!event.isRelease() && !buf_.empty() && *config_.readlineKeyBindings &&
+        (event.key().states().test(KeyState::Alt) || event.key().states().test(KeyState::Meta)) &&
+        !event.key().states().testAny(KeyStates{KeyState::Ctrl, KeyState::Super,
+                                                KeyState::Super2, KeyState::Hyper,
+                                                KeyState::Hyper2, KeyState::Mod5})) {
+        const bool doublePin = isDoublePin(*config_.pinyinScheme);
+        if (sym == FcitxKey_b || sym == FcitxKey_B || sym == FcitxKey_Left) {
+            cursorEditing_ = true;
+            cursor_ = previousPinyinWord(buf_, cursor_, doublePin);
+            updateUI(*ic);
+            event.filterAndAccept();
+            return;
+        } else if (sym == FcitxKey_f || sym == FcitxKey_F || sym == FcitxKey_Right) {
+            cursorEditing_ = true;
+            cursor_ = nextPinyinWord(buf_, cursor_, doublePin);
+            updateUI(*ic);
+            event.filterAndAccept();
             return;
         }
     }
@@ -1388,64 +2043,146 @@ void WeTypeEngine::processKey(KeyEvent &event) {
                          : static_cast<char>('A' + (sym - FcitxKey_A));
             ensureEngine();
             ++revision_;
-            buf_ += c;
             candidatesCurrent_ = false;
-            WLOG("typed alpha buffer_len=%zu revision=%llu\n",
-                 buf_.size(), static_cast<unsigned long long>(revision_));
             handled = true;
+            if (cursor_ < static_cast<int>(buf_.size())) {
+                buf_.insert(cursor_, 1, c);
+                ++cursor_;
+                eng_.send("C", nullptr);
+                requestCandidates(buf_);
+            } else {
+                buf_ += c;
+                cursor_ = static_cast<int>(buf_.size());
+                requestCandidates(replayBuffer ? buf_ : std::string(1, c));
+            }
+            WLOG("typed alpha buffer_len=%zu cursor=%d revision=%llu\n",
+                 buf_.size(), cursor_, static_cast<unsigned long long>(revision_));
             // Refresh the preedit immediately while keeping the last
             // candidate page visible until the new engine response arrives.
             updateUI(*ic);
-            requestCandidates(replayBuffer ? buf_ : std::string(1, c));
         }
-        // 方向键: 左右在当前页候选内移动, 上/下 = 上一页/下一页
-        else if (!buf_.empty() && candidatesCurrent_ && !cands_.empty() &&
-                 (sym == FcitxKey_Left || sym == FcitxKey_Right ||
-                  sym == FcitxKey_Up || sym == FcitxKey_Down)) {
-            const int page = pageSize();
-            if (sym == FcitxKey_Left && selected_ > windowStart_) {
-                --selected_;
-            } else if (sym == FcitxKey_Right &&
-                       selected_ + 1 < std::min<int>(windowStart_ + page,
-                                                     cands_.size())) {
-                ++selected_;
-            } else if (sym == FcitxKey_Up && windowStart_ > 0) {
-                windowStart_ = std::max(0, windowStart_ - page);
-                selected_ = windowStart_;
-            } else if (sym == FcitxKey_Down &&
-                       windowStart_ + page < (int)cands_.size()) {
-                windowStart_ += page;
-                selected_ = windowStart_;
+        // 方向键左右: 移动拼音光标（默认）或在当前页候选内移动
+        else if (!buf_.empty() && (sym == FcitxKey_Left || sym == FcitxKey_Right)) {
+            if (*config_.arrowKeysMoveCursor) {
+                cursorEditing_ = true;
+                if (sym == FcitxKey_Left && cursor_ > 0) {
+                    --cursor_;
+                } else if (sym == FcitxKey_Right && cursor_ < static_cast<int>(buf_.size())) {
+                    ++cursor_;
+                }
+                updateUI(*ic);
+                handled = true;
+            } else if (candidatesCurrent_ && !cands_.empty()) {
+                const int page = pageSize();
+                if (sym == FcitxKey_Left && selected_ > windowStart_) {
+                    --selected_;
+                } else if (sym == FcitxKey_Right &&
+                           selected_ + 1 < std::min<int>(windowStart_ + page,
+                                                         cands_.size())) {
+                    ++selected_;
+                }
+                updateUI(*ic);
+                handled = true;
+            } else {
+                handled = true;
             }
-            // Composition navigation remains consumed at page boundaries.
+        }
+        // Tab / Shift+Tab: 在当前页候选词之间循环切换选择 (多行模式下切换候选行)
+        else if (!buf_.empty() && (sym == FcitxKey_Tab || sym == FcitxKey_ISO_Left_Tab)) {
+            if (candidatesCurrent_ && !cands_.empty()) {
+                if (*config_.multiRowCandidates) {
+                    const int rows = std::clamp(*config_.candidateRows, 2, 10);
+                    const int cols = 10;
+                    const int pageCapacity = rows * cols;
+                    const int start = windowStart_;
+                    const int end = std::min<int>(start + pageCapacity, static_cast<int>(cands_.size()));
+                    const int totalInPage = end - start;
+                    const int actualRows = (totalInPage + cols - 1) / cols;
+                    if (actualRows > 0) {
+                        const bool backwards = (sym == FcitxKey_ISO_Left_Tab) || event.key().states().test(KeyState::Shift);
+                        if (backwards) {
+                            selectedRow_ = (selectedRow_ - 1 + actualRows) % actualRows;
+                        } else {
+                            selectedRow_ = (selectedRow_ + 1) % actualRows;
+                        }
+                        selected_ = std::min<int>(windowStart_ + selectedRow_ * cols, static_cast<int>(cands_.size()) - 1);
+                        updateUI(*ic);
+                    }
+                } else {
+                    const int page = pageSize();
+                    const int count = std::min<int>(windowStart_ + page, static_cast<int>(cands_.size())) - windowStart_;
+                    if (count > 0) {
+                        const bool backwards = (sym == FcitxKey_ISO_Left_Tab) || event.key().states().test(KeyState::Shift);
+                        if (backwards) {
+                            selected_ = windowStart_ + ((selected_ - windowStart_ - 1 + count) % count);
+                        } else {
+                            selected_ = windowStart_ + ((selected_ - windowStart_ + 1) % count);
+                        }
+                        updateUI(*ic);
+                    }
+                }
+            }
+            handled = true;
+        }
+        // Home / End: 移动拼音光标至首尾
+        else if (!buf_.empty() && (sym == FcitxKey_Home || sym == FcitxKey_End)) {
+            cursorEditing_ = true;
+            if (sym == FcitxKey_Home) {
+                cursor_ = 0;
+            } else {
+                cursor_ = static_cast<int>(buf_.size());
+            }
             updateUI(*ic);
             handled = true;
         }
-        // - / = / PgUp / PgDn : 按整页翻页。组词状态下这些键只用于翻页,
-        // 即使已到边界也要吞掉, 否则 "-" "=" 会漏进目标文档 (issue #5)。
-        else if (sym == FcitxKey_minus || sym == FcitxKey_Page_Up) {
-            if (!buf_.empty()) {
-                if (windowStart_ > 0) {
-                    windowStart_ = std::max(0, windowStart_ - pageSize());
-                    selected_ = windowStart_;
+        // Delete: 删除光标后字符，C 重建 + 前缀重放
+        else if (!buf_.empty() && sym == FcitxKey_Delete) {
+            if (cursor_ < static_cast<int>(buf_.size())) {
+                buf_.erase(cursor_, 1);
+                ++revision_;
+                candidatesCurrent_ = false;
+                handled = true;
+                eng_.send("C", nullptr);
+                if (buf_.empty()) {
+                    cursor_ = 0;
+                    cands_.clear();
+                    covers_.clear();
+                    candidatesCurrent_ = false;
+                    windowStart_ = 0;
+                    selected_ = 0;
+                    selectedRow_ = 0;
+                    updateUI(*ic);
+                } else {
+                    requestCandidates(buf_);
                     updateUI(*ic);
                 }
+            } else {
                 handled = true;
             }
         }
-        else if (sym == FcitxKey_equal || sym == FcitxKey_plus ||
-                 sym == FcitxKey_KP_Add || sym == FcitxKey_Page_Down) {
-            if (!buf_.empty()) {
-                if (candidatesCurrent_ &&
-                    windowStart_ + pageSize() < (int)cands_.size()) {
-                    windowStart_ += pageSize();
-                    selected_ = windowStart_;
-                    updateUI(*ic);
-                }
-                handled = true;
+        // 翻上一页: 按配置的按键列表 (默认 -、↑、PgUp 等)。组词状态下这些键只用于翻页,
+        // 即使已到边界也要吞掉, 否则按键会漏进目标文档 (issue #5)。
+        else if (!buf_.empty() && event.key().checkKeyList(*config_.prevPage)) {
+            if (windowStart_ > 0) {
+                windowStart_ = std::max(0, windowStart_ - pageSize());
+                selected_ = windowStart_;
+                selectedRow_ = 0;
+                updateUI(*ic);
             }
+            handled = true;
         }
-        else if (const auto symbol = chinesePunctuation(ic,sym); !symbol.empty()) {
+        // 翻下一页: 按配置的按键列表 (默认 =、+、KP_Add、↓、PgDn 等)。
+        else if (!buf_.empty() && event.key().checkKeyList(*config_.nextPage)) {
+            if (candidatesCurrent_ &&
+                windowStart_ + pageSize() < (int)cands_.size()) {
+                windowStart_ += pageSize();
+                selected_ = windowStart_;
+                selectedRow_ = 0;
+                updateUI(*ic);
+            }
+            handled = true;
+        }
+        else if (const auto symbol = punctuationText(ic,sym); !symbol.empty()) {
             if (!buf_.empty()) {
                 const std::string text = !candidatesCurrent_ || cands_.empty() ? buf_ : cands_[selected_];
                 if (candidatesCurrent_ && !cands_.empty() &&
@@ -1458,15 +2195,47 @@ void WeTypeEngine::processKey(KeyEvent &event) {
                 handled = true;
             }
         }
-        // 数字选词(全局序号 = 页首 + 数字, 0 选第 10 个)
-        else if ((sym >= FcitxKey_1 && sym <= FcitxKey_9) ||
-                 (sym == FcitxKey_0 && pageSize() >= 10)) {
-            const int ordinal = (sym == FcitxKey_0) ? 9
-                              : static_cast<int>(sym - FcitxKey_1);
-            const int idx = windowStart_ + ordinal;
-            if (ordinal < pageSize() && candidatesCurrent_ && !cands_.empty() &&
-                idx < (int)cands_.size()) {
-                commitCandidate(ic, idx);
+        // 数字选词 (1-9, 0 以及小键盘数字 KP_1-KP_9, KP_0)
+        else if (!buf_.empty() && (
+                 (sym >= FcitxKey_1 && sym <= FcitxKey_9) ||
+                 (sym >= FcitxKey_KP_1 && sym <= FcitxKey_KP_9) ||
+                 ((sym == FcitxKey_0 || sym == FcitxKey_KP_0) &&
+                  (*config_.multiRowCandidates || pageSize() >= 10)))) {
+            int ordinal = -1;
+            if (sym >= FcitxKey_1 && sym <= FcitxKey_9) {
+                ordinal = static_cast<int>(sym - FcitxKey_1);
+            } else if (sym == FcitxKey_0) {
+                ordinal = 9;
+            } else if (sym >= FcitxKey_KP_1 && sym <= FcitxKey_KP_9) {
+                ordinal = static_cast<int>(sym - FcitxKey_KP_1);
+            } else if (sym == FcitxKey_KP_0) {
+                ordinal = 9;
+            }
+
+            int idx = -1;
+            if (*config_.multiRowCandidates) {
+                const int cols = 10;
+                idx = windowStart_ + selectedRow_ * cols + ordinal;
+                const int rowEnd = std::min<int>(windowStart_ + (selectedRow_ + 1) * cols, static_cast<int>(cands_.size()));
+                if (idx >= rowEnd) {
+                    idx = -1;
+                }
+            } else {
+                if (ordinal < pageSize()) {
+                    idx = windowStart_ + ordinal;
+                }
+            }
+
+            if (candidatesCurrent_ && !cands_.empty()) {
+                if (idx >= 0 && idx < static_cast<int>(cands_.size())) {
+                    commitCandidate(ic, idx);
+                    handled = true;
+                }
+            } else if (!buf_.empty() && (ordinal < pageSize() || *config_.multiRowCandidates)) {
+                // 候选还在获取中（如光标移动编辑后重建会话），挂起选词意图，候选到达后自动上屏
+                const int target = idx >= 0 ? idx : (windowStart_ + ordinal);
+                const char trig = (ordinal == 9) ? '0' : static_cast<char>('1' + ordinal);
+                armPending(ic, target, trig);
                 handled = true;
             }
         }
@@ -1474,7 +2243,7 @@ void WeTypeEngine::processKey(KeyEvent &event) {
         else if (sym == FcitxKey_space) {
             if (!buf_.empty()) {
                 if (candidatesCurrent_ && !cands_.empty()) commitCandidate(ic, selected_);   // 含部分选词与词库学习
-                else armPending(ic);
+                else armPending(ic, selected_, ' ');
                 handled = true;
             }
         }
@@ -1486,24 +2255,31 @@ void WeTypeEngine::processKey(KeyEvent &event) {
                 handled = true;
             }
         }
-        // 退格: C 重建 + 前缀重放
+        // 退格: 删除光标前字符，C 重建 + 前缀重放
         else if (sym == FcitxKey_BackSpace) {
             if (!buf_.empty()) {
-                buf_.pop_back();
-                ++revision_;
-                candidatesCurrent_ = false;
-                handled = true;
-                eng_.send("C", nullptr);
-                if (buf_.empty()) {
-                    cands_.clear();
-                    covers_.clear();
+                if (cursor_ > 0) {
+                    buf_.erase(cursor_ - 1, 1);
+                    --cursor_;
+                    ++revision_;
                     candidatesCurrent_ = false;
-                    windowStart_ = 0;
-                    selected_ = 0;
-                    updateUI(*ic);
+                    handled = true;
+                    eng_.send("C", nullptr);
+                    if (buf_.empty()) {
+                        cursor_ = 0;
+                        cands_.clear();
+                        covers_.clear();
+                        candidatesCurrent_ = false;
+                        windowStart_ = 0;
+                        selected_ = 0;
+                        selectedRow_ = 0;
+                        updateUI(*ic);
+                    } else {
+                        requestCandidates(buf_);
+                        updateUI(*ic);
+                    }
                 } else {
-                    requestCandidates(buf_);
-                    updateUI(*ic);
+                    handled = true;
                 }
             }
         }

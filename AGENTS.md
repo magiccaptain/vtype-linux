@@ -25,7 +25,7 @@ uname -m; . /etc/os-release; echo "$PRETTY_NAME"; echo "$XDG_SESSION_TYPE $XDG_C
 fcitx5 --version; pgrep -a fcitx5; fcitx5-remote
 ```
 
-- 实机验证过的只有 x86_64 + Ubuntu 22.04 + KDE/X11。其他环境可以装，但要告诉用户这是没验证过的组合，装完请他反馈。
+- 维护者日常用 x86_64 + Ubuntu 22.04 + KDE/X11；社区另反馈过 Ubuntu 26.04 GNOME/Wayland、Kubuntu 26.04、NixOS Niri/Wayland、Arch Linux Niri/Wayland 可用，见 README 的“环境”表。不在表里的组合也可以装，但要告诉用户这是没验证过的，装完请他反馈。
 - 没装 Fcitx5，或者 Fcitx5 不是当前输入法框架时（`fcitx5-remote` 报错或 `pgrep` 没结果）：Ubuntu 上是 `sudo apt install fcitx5 fcitx5-config-qt`，再 `im-config -n fcitx5`，需要**重新登录**。这会替换用户现有的输入法框架（如 ibus），务必先征得同意。
 
 ### 2. 安装依赖、编译
@@ -102,7 +102,28 @@ python3 ~/.local/lib/wetype-ime/arm64/wetype-cloud.py status
 
 ### 7. 剪贴板互通（可选，需要用户同意）
 
-启用后，用户之后复制的所有纯文本都会发给官方服务器，务必先说明并征得同意。需要 `xclip`（X11）或 `wl-clipboard`（Wayland），在图形桌面的终端执行 `wetype-cloud.py clipboard enable`，用 `clipboard status` 检查。详见 [docs/剪贴板互通.md](docs/剪贴板互通.md)。
+启用后，用户之后复制的所有纯文本都会发给官方服务器，务必先说明并征得同意。需要 `xclip`（X11）或 `wl-clipboard`（Wayland），在图形桌面的终端执行 `wetype-cloud.py clipboard enable`，用 `clipboard status` 检查。图片同步要再加 `--images`，之后复制的截图等图片都会上传，须另行征得同意；X11 / XWayland 上还需要 `python3-gi gir1.2-gtk-3.0`。详见 [docs/剪贴板互通.md](docs/剪贴板互通.md)。
+
+### 8. 语音输入（可选，需要用户同意）
+
+按住语音键期间的录音会发给官方服务器识别，务必先说明并征得同意。需要已关联设备（第 6 步）、`libopus0` 和 `pw-record`（或 `parecord`、`arecord`）。先用 `wetype-cloud.py voice --record 3` 让用户在终端里试一句；能识别后，请用户在 Fcitx5 设置的“微信拼音”配置里设置“语音输入快捷键”（推荐右 Ctrl）。用户希望你代劳时，先 `fcitx5-remote -e` 退出 Fcitx5，在 `~/.config/fcitx5/conf/wetype.conf` 写入 `[VoiceInputKey]` 节、`0=Control_R`，再 `fcitx5 -d`。详见 [docs/语音输入.md](docs/语音输入.md)。
+
+### 更新已有安装
+
+已装过的用户更新到新版本时按这个顺序做，个人词库、关联身份和设置都会保留（Nix 安装按 [docs/NixOS.md](docs/NixOS.md) 更新）：
+
+```sh
+cd vtype-linux && git pull
+export ANDROID_NDK_HOME="$PWD/.deps/tools/android-ndk-r27c"
+bash scripts/e2_img.sh
+```
+
+1. 编译成功后，告诉用户接下来要退出 Fcitx5（会打断正在输入的内容），征得同意再执行 `fcitx5-remote -e`。
+2. `./WeTypeIME-Engine-x86_64.AppImage install --user`，再 `fcitx5 -d` 启动。
+3. 启用了剪贴板互通的，执行 `systemctl --user restart wetype-clipboard.service`。
+4. 跑第 5 步的自检，请用户试打。
+
+新版本新增的可选功能（如剪贴板图片）不会自动开启，先向用户说明，征得同意再启用。
 
 ## 必须遵守
 
@@ -117,7 +138,8 @@ python3 ~/.local/lib/wetype-ime/arm64/wetype-cloud.py status
 |---|---|
 | 候选窗不出现 | `fcitx5-remote -n` 是否为 `wetype-im`；`~/.local/state/wetype-ime/harness.log` 末尾是否有崩溃；重新跑自检 |
 | 引擎启动即退出，日志里有 `Resource may not ready` | 词库清单和资源不配套，见 [docs/更新公共词库.md](docs/更新公共词库.md) |
-| 剪贴板不同步 | `wetype-cloud.py clipboard status` 的 `running` 和 `error`；`systemctl --user status wetype-clipboard.service`；官方客户端是否开启跨设备复制粘贴 |
+| 剪贴板不同步 | `wetype-cloud.py clipboard status` 的 `running` 和 `error`；`journalctl --user -u wetype-clipboard.service` 的逐条收发记录（跳过原因、耗时）；官方客户端是否开启跨设备复制粘贴 |
+| 语音键按住没反应或提示出错 | 先在终端跑 `wetype-cloud.py voice --record 3`；提示的含义见 [docs/语音输入.md](docs/语音输入.md) 的常见问题 |
 | 云候选没反应 | `wetype-cloud.py status`；网络要能直连官方服务器，代理只认系统级 TUN，不读 `http_proxy` |
 | 某个应用里打不了字 | 查该应用用的输入法模块（GTK/Qt 的 `*_IM_MODULE`、XIM、Wayland text-input），换个应用对比 |
 
@@ -144,10 +166,10 @@ cmake -S fcitx5-wetype -B build && cmake --build build && ctest --test-dir build
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 tests/test_snapshot_transport.py
 python3 scripts/check-public-source.py
-python3 scripts/test_clipboard_desktop.py --backend x11   # 需要 Xvfb、xclip
+python3 scripts/test_clipboard_desktop.py --backend x11   # 需要 Xvfb、xclip、python3-gi 和 GTK 3
 ```
 
-插件改动还要在真实环境验证：重新编译后把 `build/libfcitx5-wetype.so` 装到 `~/.local/lib/fcitx5/`（先备份），重启 Fcitx5 试打。`fcitx5-wetype/e2e/` 下有基于 Xvfb 的界面测试，可以在不影响用户桌面的情况下验证按键行为。
+插件改动还要在真实环境验证：重新编译后把 `build/libfcitx5-wetype.so` 装到 `~/.local/lib/fcitx5/`（先备份），重启 Fcitx5 试打。`fcitx5-wetype/e2e/` 下有基于 Xvfb 的界面测试，可以在不影响用户桌面的情况下验证按键行为。语音输入用 `LIB=$PWD/build/libfcitx5-wetype bash fcitx5-wetype/e2e/run_voice_e2e.sh` 验证按住、松开、取消和界面显示；它用替身辅助进程，不录音、不联网，但需要已安装的引擎。
 
 ### 约定
 
